@@ -16,7 +16,8 @@ dependencies = [
     "nvidia-cutlass-dsl==4.4.0",
     "quack-kernels",
     "ninja",
-    "psutil"
+    "psutil",
+    "pip>=26.0.1",
 ]
 
 [[tool.uv.index]]
