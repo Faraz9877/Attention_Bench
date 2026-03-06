@@ -1,0 +1,4 @@
+.venv
+**pycache**
+uv.lock
+**/*.whl

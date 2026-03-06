@@ -1,0 +1,28 @@
+[project]
+name = "WanBlock"
+version = "0.0.0"
+description = "use for profiling"
+requires-python = "==3.12.3"
+dependencies = [
+    "fire",
+    "torch",
+    "tqdm",
+    "yunchang==0.6.0",
+    "pandas",
+    "nvtx",
+    "tensorboard",
+    "torch-tb-profiler",
+    "pytest>=9.0.2",
+    "nvidia-cutlass-dsl==4.4.0",
+    "quack-kernels",
+    "ninja",
+    "psutil"
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
