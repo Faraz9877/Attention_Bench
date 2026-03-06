@@ -124,11 +124,38 @@ def add_repo_sources_to_path() -> None:
     root = Path(__file__).resolve().parents[1]
     candidate_paths = [
         root / "flash-attention",
+        root / "flash-attention" / "hopper",
     ]
     for path in candidate_paths:
         path_str = str(path)
         if path.exists() and path_str not in sys.path:
             sys.path.insert(0, path_str)
+
+
+def _as_varlen_nhd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    batch, seq, _, _ = q.shape
+    cu_seqlens = torch.arange(0, (batch + 1) * seq, step=seq, device=q.device, dtype=torch.int32)
+    q_flat = q.reshape(batch * seq, q.shape[2], q.shape[3]).contiguous()
+    k_flat = k.reshape(batch * seq, k.shape[2], k.shape[3]).contiguous()
+    v_flat = v.reshape(batch * seq, v.shape[2], v.shape[3]).contiguous()
+    return q_flat, k_flat, v_flat, cu_seqlens, seq
+
+
+def _fa_kvcache_wrapper(
+    fa_with_kvcache: Callable,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    causal: bool,
+) -> torch.Tensor:
+    # Use empty cache + (k, v) append so each invocation is self-contained.
+    k_cache = torch.empty_like(k)
+    v_cache = torch.empty_like(v)
+    return fa_with_kvcache(q, k_cache, v_cache, k=k, v=v, cache_seqlens=0, causal=causal)
 
 
 def build_methods(arch: str) -> tuple[list[BenchMethod], list[str]]:
@@ -157,11 +184,72 @@ def build_methods(arch: str) -> tuple[list[BenchMethod], list[str]]:
                 )
             )
         if hasattr(flash_mod, "flash_attn_qkvpacked_func"):
+
             def fa2_qkvpacked(q, k, v, causal):
                 qkv = torch.stack((q, k, v), dim=2)
                 return flash_mod.flash_attn_qkvpacked_func(qkv, causal=causal)
 
             methods.append(BenchMethod(name="flash.fa2_qkvpacked", group="flash", fn=fa2_qkvpacked))
+        if hasattr(flash_mod, "flash_attn_kvpacked_func"):
+
+            def fa2_kvpacked(q, k, v, causal):
+                kv = torch.stack((k, v), dim=2)
+                return flash_mod.flash_attn_kvpacked_func(q, kv, causal=causal)
+
+            methods.append(BenchMethod(name="flash.fa2_kvpacked", group="flash", fn=fa2_kvpacked))
+        if hasattr(flash_mod, "flash_attn_varlen_func"):
+
+            def fa2_varlen(q, k, v, causal):
+                q_flat, k_flat, v_flat, cu_seqlens, max_seqlen = _as_varlen_nhd(q, k, v)
+                out = flash_mod.flash_attn_varlen_func(
+                    q_flat,
+                    k_flat,
+                    v_flat,
+                    cu_seqlens,
+                    cu_seqlens,
+                    max_seqlen,
+                    max_seqlen,
+                    causal=causal,
+                )
+                return out.reshape_as(q)
+
+            methods.append(BenchMethod(name="flash.fa2_varlen", group="flash", fn=fa2_varlen))
+        if hasattr(flash_mod, "flash_attn_varlen_qkvpacked_func"):
+
+            def fa2_varlen_qkvpacked(q, k, v, causal):
+                q_flat, k_flat, v_flat, cu_seqlens, max_seqlen = _as_varlen_nhd(q, k, v)
+                qkv = torch.stack((q_flat, k_flat, v_flat), dim=1)
+                out = flash_mod.flash_attn_varlen_qkvpacked_func(qkv, cu_seqlens, max_seqlen, causal=causal)
+                return out.reshape_as(q)
+
+            methods.append(BenchMethod(name="flash.fa2_varlen_qkvpacked", group="flash", fn=fa2_varlen_qkvpacked))
+        if hasattr(flash_mod, "flash_attn_varlen_kvpacked_func"):
+
+            def fa2_varlen_kvpacked(q, k, v, causal):
+                q_flat, k_flat, v_flat, cu_seqlens, max_seqlen = _as_varlen_nhd(q, k, v)
+                kv = torch.stack((k_flat, v_flat), dim=1)
+                out = flash_mod.flash_attn_varlen_kvpacked_func(
+                    q_flat,
+                    kv,
+                    cu_seqlens,
+                    cu_seqlens,
+                    max_seqlen,
+                    max_seqlen,
+                    causal=causal,
+                )
+                return out.reshape_as(q)
+
+            methods.append(BenchMethod(name="flash.fa2_varlen_kvpacked", group="flash", fn=fa2_varlen_kvpacked))
+        if hasattr(flash_mod, "flash_attn_with_kvcache"):
+            methods.append(
+                BenchMethod(
+                    name="flash.fa2_kvcache",
+                    group="flash",
+                    fn=lambda q, k, v, causal: _fa_kvcache_wrapper(
+                        flash_mod.flash_attn_with_kvcache, q, k, v, causal
+                    ),
+                )
+            )
 
     fa2_iface, fa2_iface_err = import_optional("flash_attn.flash_attn_interface")
     if fa2_iface is None:
@@ -174,6 +262,39 @@ def build_methods(arch: str) -> tuple[list[BenchMethod], list[str]]:
                 fn=lambda q, k, v, causal: fa2_iface.flash_attn_func(q, k, v, causal=causal),
             )
         )
+        if hasattr(fa2_iface, "flash_attn_varlen_func"):
+
+            def fa2_interface_varlen(q, k, v, causal):
+                q_flat, k_flat, v_flat, cu_seqlens, max_seqlen = _as_varlen_nhd(q, k, v)
+                out = fa2_iface.flash_attn_varlen_func(
+                    q_flat,
+                    k_flat,
+                    v_flat,
+                    cu_seqlens,
+                    cu_seqlens,
+                    max_seqlen,
+                    max_seqlen,
+                    causal=causal,
+                )
+                return out.reshape_as(q)
+
+            methods.append(
+                BenchMethod(
+                    name="flash.fa2_interface_varlen",
+                    group="flash",
+                    fn=fa2_interface_varlen,
+                )
+            )
+        if hasattr(fa2_iface, "flash_attn_with_kvcache"):
+            methods.append(
+                BenchMethod(
+                    name="flash.fa2_interface_kvcache",
+                    group="flash",
+                    fn=lambda q, k, v, causal: _fa_kvcache_wrapper(
+                        fa2_iface.flash_attn_with_kvcache, q, k, v, causal
+                    ),
+                )
+            )
 
     fa_cute, fa_cute_err = import_optional("flash_attn.cute.interface")
     if fa_cute is None:
@@ -188,10 +309,103 @@ def build_methods(arch: str) -> tuple[list[BenchMethod], list[str]]:
             )
         )
 
+    fa3_mod, fa3_err = import_optional("flash_attn_interface")
+    if fa3_mod is None:
+        availability_notes.append(f"skip flash_attn_interface (FA3 package): {fa3_err}")
+    else:
+        if hasattr(fa3_mod, "flash_attn_func"):
+            methods.append(
+                BenchMethod(
+                    name="flash.fa3",
+                    group="flash",
+                    fn=lambda q, k, v, causal: fa3_mod.flash_attn_func(q, k, v, causal=causal),
+                )
+            )
+        if hasattr(fa3_mod, "flash_attn_qkvpacked_func"):
+
+            def fa3_qkvpacked(q, k, v, causal):
+                qkv = torch.stack((q, k, v), dim=2)
+                return fa3_mod.flash_attn_qkvpacked_func(qkv, causal=causal)
+
+            methods.append(BenchMethod(name="flash.fa3_qkvpacked", group="flash", fn=fa3_qkvpacked))
+        if hasattr(fa3_mod, "flash_attn_varlen_func"):
+
+            def fa3_varlen(q, k, v, causal):
+                q_flat, k_flat, v_flat, cu_seqlens, max_seqlen = _as_varlen_nhd(q, k, v)
+                out = fa3_mod.flash_attn_varlen_func(
+                    q_flat,
+                    k_flat,
+                    v_flat,
+                    cu_seqlens,
+                    cu_seqlens,
+                    max_seqlen,
+                    max_seqlen,
+                    causal=causal,
+                )
+                return out.reshape_as(q)
+
+            methods.append(BenchMethod(name="flash.fa3_varlen", group="flash", fn=fa3_varlen))
+        if hasattr(fa3_mod, "flash_attn_with_kvcache"):
+            methods.append(
+                BenchMethod(
+                    name="flash.fa3_kvcache",
+                    group="flash",
+                    fn=lambda q, k, v, causal: _fa_kvcache_wrapper(
+                        fa3_mod.flash_attn_with_kvcache, q, k, v, causal
+                    ),
+                )
+            )
+        if hasattr(fa3_mod, "flash_attn_func") and hasattr(torch, "float8_e4m3fn"):
+
+            def fa3_fp8(q, k, v, causal):
+                q_fp8 = q.to(torch.float8_e4m3fn)
+                k_fp8 = k.to(torch.float8_e4m3fn)
+                v_fp8 = v.to(torch.float8_e4m3fn)
+                descale = torch.ones((1,), dtype=torch.float32, device=q.device)
+                return fa3_mod.flash_attn_func(
+                    q_fp8,
+                    k_fp8,
+                    v_fp8,
+                    softmax_scale=q.shape[-1] ** -0.5,
+                    causal=causal,
+                    q_descale=descale,
+                    k_descale=descale,
+                    v_descale=descale,
+                )
+
+            methods.append(BenchMethod(name="flash.fa3_fp8", group="flash", fn=fa3_fp8, note="FA3 FP8 fwd"))
+
     sage_mod, sage_err = import_optional("sageattention")
     if sage_mod is None:
         availability_notes.append(f"skip sageattention: {sage_err}")
     else:
+        if hasattr(sage_mod, "sageattn"):
+            methods.append(
+                BenchMethod(
+                    name="sage.auto",
+                    group="sage",
+                    fn=lambda q, k, v, causal: sage_mod.sageattn(
+                        q, k, v, tensor_layout="NHD", is_causal=causal
+                    ),
+                )
+            )
+        if hasattr(sage_mod, "sageattn_varlen"):
+
+            def sage_varlen(q, k, v, causal):
+                q_flat, k_flat, v_flat, cu_seqlens, max_seqlen = _as_varlen_nhd(q, k, v)
+                out = sage_mod.sageattn_varlen(
+                    q_flat,
+                    k_flat,
+                    v_flat,
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_k=cu_seqlens,
+                    max_seqlen_q=max_seqlen,
+                    max_seqlen_k=max_seqlen,
+                    is_causal=causal,
+                )
+                return out.reshape_as(q)
+
+            methods.append(BenchMethod(name="sage.varlen", group="sage", fn=sage_varlen))
         if hasattr(sage_mod, "sageattn_qk_int8_pv_fp16_triton"):
             methods.append(
                 BenchMethod(
@@ -228,6 +442,24 @@ def build_methods(arch: str) -> tuple[list[BenchMethod], list[str]]:
                             name=f"sage.fp8_cuda.{qgran}.{accum}",
                             group="sage",
                             fn=lambda q, k, v, causal, qgran=qgran, accum=accum: sage_mod.sageattn_qk_int8_pv_fp8_cuda(
+                                q,
+                                k,
+                                v,
+                                tensor_layout="NHD",
+                                is_causal=causal,
+                                qk_quant_gran=qgran,
+                                pv_accum_dtype=accum,
+                            ),
+                        )
+                    )
+        if hasattr(sage_mod, "sageattn_qk_int8_pv_fp8_cuda_sm90"):
+            for qgran in ("per_thread", "per_warp"):
+                for accum in ("fp32", "fp32+fp32"):
+                    methods.append(
+                        BenchMethod(
+                            name=f"sage.fp8_cuda_sm90.{qgran}.{accum}",
+                            group="sage",
+                            fn=lambda q, k, v, causal, qgran=qgran, accum=accum: sage_mod.sageattn_qk_int8_pv_fp8_cuda_sm90(
                                 q,
                                 k,
                                 v,

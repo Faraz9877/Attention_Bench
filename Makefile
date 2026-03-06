@@ -3,8 +3,9 @@ CONTAINER_NAME=attn_dev
 PYTHON_VERSION=3.11
 VENV=.venv
 PYTHON=$(VENV)/bin/python
-DIST=dist_b200
+DIST=dist_h100
 FLASH_WHL=$(DIST)/flash_attn-2.8.3-cp312-cp312-linux_x86_64.whl
+FLASH3_WHL=$(DIST)/flash_attn_3-3.0.0-cp39-abi3-linux_x86_64.whl
 SAGE_SRC=../SageAttention
 
 .PHONY: docker_build docker_run docker_push install_dep install_dep_best_effort install_optional_baselines bench bench_causal clean
@@ -29,7 +30,8 @@ docker_push:
 install_dep:
 	uv sync
 	uv pip install --python $(PYTHON) $(FLASH_WHL)
-	TORCH_CUDA_ARCH_LIST="10.0" MAX_JOBS=32 EXT_PARALLEL=4 NVCC_APPEND_FLAGS="--threads 8" \
+	uv pip install --python $(PYTHON) $(FLASH3_WHL)
+	TORCH_CUDA_ARCH_LIST="9.0" MAX_JOBS=32 EXT_PARALLEL=4 NVCC_APPEND_FLAGS="--threads 8" \
 		uv pip install --python $(PYTHON) -e $(SAGE_SRC) --no-build-isolation
 
 install_optional_baselines:

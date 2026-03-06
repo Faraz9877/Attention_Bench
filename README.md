@@ -46,5 +46,5 @@ To include numerical checks against `torch.nn.functional.scaled_dot_product_atte
 
 ## Notes
 
-- The script benchmarks fixed-shape `q/k/v` methods. Varlen and KV-cache APIs are not included.
+- The script benchmarks fixed-shape `q/k/v` methods and also includes varlen / KV-cache API wrappers for FA2, FA3, and SageAttention where available.
 - Unsupported methods are reported as `SKIP`; OOM cases are reported as `OOM`.
