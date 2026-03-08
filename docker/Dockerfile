@@ -1,4 +1,4 @@
-FROM nvcr.io/nvidia/pytorch:25.11-py3
+FROM nvcr.io/nvidia/pytorch:26.02-py3
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -51,8 +51,6 @@ RUN python3 -m venv /opt/venv \
 #  && /opt/venv/bin/pip install torch --index-url https://download.pytorch.org/whl/nightly/cu129
 
 ENV PATH="/opt/venv/bin:$PATH"
-
-RUN git clone https://github.com/NVIDIA/cutlass.git /cutlass  && cd /cutlass && git checkout b995f933179c22d3fe0d871c3a53d11e4681950f
 
 EXPOSE 8888
 

@@ -1,9 +1,9 @@
 IMG=baseten/attn:base
 CONTAINER_NAME=attn_dev
-PYTHON_VERSION=3.11
 VENV=.venv
 PYTHON=$(VENV)/bin/python
-DIST=dist_h100
+GPU_MODEL := $(shell nvidia-smi --query-gpu=name --format=csv,noheader | head -n1 | grep -oE '[HB][0-9]+' | tr '[:upper:]' '[:lower:]')
+DIST=dist_$(GPU_MODEL)
 FLASH_WHL=$(DIST)/flash_attn-2.8.3-cp312-cp312-linux_x86_64.whl
 FLASH3_WHL=$(DIST)/flash_attn_3-3.0.0-cp39-abi3-linux_x86_64.whl
 SAGE_SRC=../SageAttention
@@ -30,8 +30,16 @@ docker_push:
 install_dep:
 	uv sync
 	uv pip install --python $(PYTHON) $(FLASH_WHL)
-	uv pip install --python $(PYTHON) $(FLASH3_WHL)
-	TORCH_CUDA_ARCH_LIST="9.0" MAX_JOBS=32 EXT_PARALLEL=4 NVCC_APPEND_FLAGS="--threads 8" \
+	if [ "$(DIST)" = "dist_h100" ]; then \
+		TORCH_CUDA_ARCH_LIST="9.0"; \
+		uv pip install --python $(PYTHON) $(FLASH3_WHL); \
+	fi
+	if [ "$(DIST)" = "dist_b200" ]; then \
+		TORCH_CUDA_ARCH_LIST="10.0;10.0a"; \
+		uv pip install --python $(PYTHON) -e ../cutile-python/; \
+		uv pip install --python $(PYTHON) ../cutile-python/experimental/; \
+	fi
+	MAX_JOBS=32 EXT_PARALLEL=4 NVCC_APPEND_FLAGS="--threads 8" \
 		uv pip install --python $(PYTHON) -e $(SAGE_SRC) --no-build-isolation
 
 install_optional_baselines:
