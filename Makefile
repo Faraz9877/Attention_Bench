@@ -7,6 +7,7 @@ DIST=dist_$(GPU_MODEL)
 FLASH_WHL=$(DIST)/flash_attn-2.8.3-cp312-cp312-linux_x86_64.whl
 FLASH3_WHL=$(DIST)/flash_attn_3-3.0.0-cp39-abi3-linux_x86_64.whl
 SAGE_SRC=../SageAttention
+TILEGYM_SRC=../TileGym
 
 .PHONY: docker_build docker_run docker_push install_dep install_dep_best_effort install_optional_baselines bench bench_causal clean
 
@@ -41,6 +42,9 @@ install_dep:
 	fi
 	MAX_JOBS=32 EXT_PARALLEL=4 NVCC_APPEND_FLAGS="--threads 8" \
 		uv pip install --python $(PYTHON) -e $(SAGE_SRC) --no-build-isolation
+	uv pip install flash-attn-4 --prerelease=allow
+	TORCH_CUDA_ARCH_LIST="9.0" MAX_JOBS=32 EXT_PARALLEL=4 NVCC_APPEND_FLAGS="--threads 8" \
+		uv pip install --python $(PYTHON) -e $(TILEGYM_SRC)
 
 install_optional_baselines:
 	@true

@@ -1,0 +1,28 @@
+{
+  "models": [
+    {
+      "name": "qwen-image",
+      "batch_size": 4,
+      "num_heads": 24,
+      "num_kv_heads": 24,
+      "head_dim": 128,
+      "seq_lens": [1024, 2048, 4096]
+    },
+    {
+      "name": "flux.2-dev",
+      "batch_size": 4,
+      "num_heads": 24,
+      "num_kv_heads": 24,
+      "head_dim": 128,
+      "seq_lens": [1024, 2048, 4096]
+    },
+    {
+      "name": "wan2.2-t2v-a14b",
+      "batch_size": 4,
+      "num_heads": 40,
+      "num_kv_heads": 40,
+      "head_dim": 128,
+      "seq_lens": [1024, 2048, 4096]
+    }
+  ]
+}

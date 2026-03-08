@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import importlib
+import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +29,16 @@ class BenchResult:
     tflops: Optional[float] = None
     max_abs_err: Optional[float] = None
     message: str = ""
+
+
+@dataclass
+class ModelBenchConfig:
+    name: str
+    batch_size: int
+    num_heads: int
+    head_dim: int
+    seq_lens: list[int]
+    num_kv_heads: Optional[int] = None
 
 
 def parse_seq_lens(seq_lens: str) -> List[int]:
@@ -70,6 +81,49 @@ def short_error(exc: BaseException) -> str:
     if len(msg) > 120:
         msg = msg[:117] + "..."
     return f"{type(exc).__name__}: {msg}"
+
+
+def load_model_bench_configs(config_path: Path) -> list[ModelBenchConfig]:
+    data = json.loads(config_path.read_text())
+    rows = data["models"] if isinstance(data, dict) else data
+    if not isinstance(rows, list):
+        raise ValueError("Model config must be a list or an object with a 'models' list.")
+
+    models: list[ModelBenchConfig] = []
+    for idx, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise ValueError(f"Model config entry {idx} must be an object.")
+        name = str(row.get("name", f"model_{idx}"))
+        if "batch_size" not in row or "num_heads" not in row or "head_dim" not in row or "seq_lens" not in row:
+            raise ValueError(
+                f"Model '{name}' must define batch_size, num_heads, head_dim, and seq_lens."
+            )
+        seq_lens_raw = row["seq_lens"]
+        if isinstance(seq_lens_raw, str):
+            seq_lens = parse_seq_lens(seq_lens_raw)
+        elif isinstance(seq_lens_raw, list):
+            seq_lens = [int(v) for v in seq_lens_raw]
+        else:
+            raise ValueError(f"Model '{name}' has invalid seq_lens type: {type(seq_lens_raw)}")
+        models.append(
+            ModelBenchConfig(
+                name=name,
+                batch_size=int(row["batch_size"]),
+                num_heads=int(row["num_heads"]),
+                head_dim=int(row["head_dim"]),
+                seq_lens=seq_lens,
+                num_kv_heads=int(row["num_kv_heads"]) if row.get("num_kv_heads") is not None else None,
+            )
+        )
+    return models
+
+
+def should_keep_model(name: str, filter_expr: str) -> bool:
+    if not filter_expr or filter_expr.lower() == "all":
+        return True
+    tokens = [tok.strip().lower() for tok in filter_expr.split(",") if tok.strip()]
+    lower_name = name.lower()
+    return any(tok in lower_name for tok in tokens)
 
 
 @torch.inference_mode()
@@ -308,6 +362,18 @@ def build_methods(arch: str) -> tuple[list[BenchMethod], list[str]]:
                 note="CuTe interface",
             )
         )
+    fa4_api, fa4_api_err = import_optional("flash_attn.cute")
+    if fa4_api is None:
+        availability_notes.append(f"skip flash_attn.cute (FA4 API path): {fa4_api_err}")
+    elif hasattr(fa4_api, "flash_attn_func"):
+        methods.append(
+            BenchMethod(
+                name="flash.cute_api",
+                group="flash",
+                fn=lambda q, k, v, causal: fa4_api.flash_attn_func(q, k, v, causal=causal),
+                note="CuTe package API (from flash_attn.cute import flash_attn_func)",
+            )
+        )
 
     fa3_mod, fa3_err = import_optional("flash_attn_interface")
     if fa3_mod is None:
@@ -361,16 +427,18 @@ def build_methods(arch: str) -> tuple[list[BenchMethod], list[str]]:
                 q_fp8 = q.to(torch.float8_e4m3fn)
                 k_fp8 = k.to(torch.float8_e4m3fn)
                 v_fp8 = v.to(torch.float8_e4m3fn)
-                descale = torch.ones((1,), dtype=torch.float32, device=q.device)
+                # FA3 expects 2D descale tensors, with Q using query heads and K/V using KV heads.
+                q_descale = torch.ones((q.shape[0], q.shape[2]), dtype=torch.float32, device=q.device)
+                kv_descale = torch.ones((k.shape[0], k.shape[2]), dtype=torch.float32, device=q.device)
                 return fa3_mod.flash_attn_func(
                     q_fp8,
                     k_fp8,
                     v_fp8,
                     softmax_scale=q.shape[-1] ** -0.5,
                     causal=causal,
-                    q_descale=descale,
-                    k_descale=descale,
-                    v_descale=descale,
+                    q_descale=q_descale,
+                    k_descale=kv_descale,
+                    v_descale=kv_descale,
                 )
 
             methods.append(BenchMethod(name="flash.fa3_fp8", group="flash", fn=fa3_fp8, note="FA3 FP8 fwd"))
@@ -516,11 +584,32 @@ def main() -> None:
     parser.add_argument("--num-heads", type=int, default=32)
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--seq-lens", type=str, default="1024,2048,4096")
+    parser.add_argument(
+        "--models-config",
+        type=str,
+        default=str(Path(__file__).resolve().with_name("model_dimensions.json")),
+        help="Path to JSON model-dimension config.",
+    )
+    parser.add_argument(
+        "--models",
+        type=str,
+        default="all",
+        help="Comma-separated substrings to filter model names from --models-config (default: all).",
+    )
     parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16"])
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--causal-only", action="store_true")
+    parser.add_argument(
+        "--causal-only",
+        action="store_true",
+        help="Run only causal attention shapes.",
+    )
+    parser.add_argument(
+        "--include-causal",
+        action="store_true",
+        help="Run both non-causal and causal attention shapes (default runs non-causal only).",
+    )
     parser.add_argument("--check", action="store_true", help="Compare outputs against torch SDPA (max abs error).")
     parser.add_argument(
         "--methods",
@@ -538,6 +627,8 @@ def main() -> None:
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required.")
+    if args.causal_only and args.include_causal:
+        raise ValueError("--causal-only and --include-causal cannot be used together.")
 
     add_repo_sources_to_path()
 
@@ -545,12 +636,32 @@ def main() -> None:
     device = torch.device("cuda", args.device)
     arch = get_arch(device)
     dtype = parse_dtype(args.dtype)
-    seq_lens = parse_seq_lens(args.seq_lens)
+
+    model_cfg_path = Path(args.models_config)
+    if model_cfg_path.exists():
+        model_configs = load_model_bench_configs(model_cfg_path)
+        model_configs = [m for m in model_configs if should_keep_model(m.name, args.models)]
+    else:
+        cli_seq_lens = parse_seq_lens(args.seq_lens)
+        print(f"[warn] model config not found at {model_cfg_path}; using CLI dimensions.")
+        model_configs = [
+            ModelBenchConfig(
+                name="cli",
+                batch_size=args.batch_size,
+                num_heads=args.num_heads,
+                head_dim=args.head_dim,
+                seq_lens=cli_seq_lens,
+                num_kv_heads=args.num_heads,
+            )
+        ]
+
+    if not model_configs:
+        raise RuntimeError("No model configs selected.")
 
     print(f"GPU arch: {arch}")
     print(
-        f"Config: batch={args.batch_size}, heads={args.num_heads}, head_dim={args.head_dim}, "
-        f"dtype={args.dtype}, seq_lens={seq_lens}, methods={args.methods}"
+        f"Config: dtype={args.dtype}, methods={args.methods}, models={len(model_configs)}, "
+        f"models_config={model_cfg_path}"
     )
 
     methods, notes = build_methods(arch)
@@ -562,53 +673,83 @@ def main() -> None:
     if not methods:
         raise RuntimeError("No methods selected.")
 
-    causal_modes = [True] if args.causal_only else [False, True]
-    for causal in causal_modes:
-        print(f"\ncausal={causal}")
-        for seq in seq_lens:
-            q = torch.randn(args.batch_size, seq, args.num_heads, args.head_dim, device=device, dtype=dtype)
-            k = torch.randn_like(q)
-            v = torch.randn_like(q)
+    if args.causal_only:
+        causal_modes = [True]
+    elif args.include_causal:
+        causal_modes = [False, True]
+    else:
+        causal_modes = [False]
+    for model in model_configs:
+        kv_heads = model.num_kv_heads if model.num_kv_heads is not None else model.num_heads
+        if model.num_heads % kv_heads != 0:
+            raise ValueError(
+                f"Model '{model.name}' has incompatible heads: num_heads={model.num_heads}, num_kv_heads={kv_heads}"
+            )
+        print(
+            f"\nmodel={model.name} batch={model.batch_size} heads={model.num_heads} "
+            f"kv_heads={kv_heads} head_dim={model.head_dim} seq_lens={model.seq_lens}"
+        )
 
-            ref = None
-            if args.check:
-                try:
-                    ref = sdpa_reference(q, k, v, causal=causal).to(torch.float32)
-                except Exception as exc:
-                    print(f"[warn] seq={seq} failed to build SDPA reference: {short_error(exc)}")
-                    ref = None
+        for causal in causal_modes:
+            for seq in model.seq_lens:
+                q = torch.randn(model.batch_size, seq, model.num_heads, model.head_dim, device=device, dtype=dtype)
+                k = torch.randn(model.batch_size, seq, kv_heads, model.head_dim, device=device, dtype=dtype)
+                v = torch.randn_like(k)
 
-            per_method: dict[str, BenchResult] = {}
-            for method in methods:
-                res = run_single_method(method, q, k, v, causal, args.warmup, args.iters, ref)
-                if res.ms is not None:
-                    res.tflops = compute_tflops(args.batch_size, args.num_heads, seq, args.head_dim, causal, res.ms)
-                per_method[method.name] = res
+                ref = None
+                if args.check:
+                    try:
+                        ref = sdpa_reference(q, k, v, causal=causal).to(torch.float32)
+                    except Exception as exc:
+                        print(f"[warn] model={model.name} seq={seq} failed to build SDPA reference: {short_error(exc)}")
+                        ref = None
 
-            baseline_ms = None
-            baseline_candidates = [args.baseline, "flash.fa2", "torch.sdpa"]
-            for candidate in baseline_candidates:
-                if candidate in per_method and per_method[candidate].status == "OK" and per_method[candidate].ms is not None:
-                    baseline_ms = per_method[candidate].ms
-                    break
+                per_method: dict[str, BenchResult] = {}
+                for method in methods:
+                    res = run_single_method(method, q, k, v, causal, args.warmup, args.iters, ref)
+                    if res.ms is not None:
+                        res.tflops = compute_tflops(model.batch_size, model.num_heads, seq, model.head_dim, causal, res.ms)
+                    per_method[method.name] = res
 
-            print(f"\nseq={seq}")
-            print("method | status | ms | tflops | speedup_vs_baseline | max_abs_err | note")
-            print("-" * 140)
-            for method in methods:
-                res = per_method[method.name]
-                if res.status != "OK":
-                    print(f"{method.name:32} | {res.status:5} | {'-':>8} | {'-':>8} | {'-':>17} | {'-':>11} | {res.message}")
-                    continue
-                speedup = baseline_ms / res.ms if (baseline_ms is not None and res.ms and res.ms > 0) else None
-                ms_str = f"{res.ms:.3f}" if res.ms is not None else "-"
-                tflops_str = f"{res.tflops:.2f}" if res.tflops is not None else "-"
-                speedup_str = f"{speedup:.3f}" if speedup is not None else "-"
-                err_str = f"{res.max_abs_err:.4e}" if res.max_abs_err is not None else "n/a"
+                baseline_ms = None
+                baseline_name = None
+                baseline_candidates = [args.baseline, "flash.fa2", "torch.sdpa"]
+                for candidate in baseline_candidates:
+                    if candidate in per_method and per_method[candidate].status == "OK" and per_method[candidate].ms is not None:
+                        baseline_ms = per_method[candidate].ms
+                        baseline_name = candidate
+                        break
+
                 print(
-                    f"{method.name:32} | {res.status:5} | {ms_str:>8} | {tflops_str:>8} | "
-                    f"{speedup_str:>17} | {err_str:>11} | {method.note}"
+                    f"\n[table] model={model.name} seq={seq} causal={causal} dtype={args.dtype} "
+                    f"batch={model.batch_size} heads={model.num_heads} kv_heads={kv_heads} head_dim={model.head_dim} "
+                    f"warmup={args.warmup} iters={args.iters} baseline={baseline_name or 'n/a'} "
+                    f"(requested={args.baseline})"
                 )
+                print("method | status | ms | tflops | speedup_vs_baseline | max_abs_err | note")
+                print("-" * 140)
+                sorted_methods = sorted(
+                    methods,
+                    key=lambda method: (
+                        0 if per_method[method.name].tflops is not None else 1,
+                        -(per_method[method.name].tflops or 0.0),
+                        method.name,
+                    ),
+                )
+                for method in sorted_methods:
+                    res = per_method[method.name]
+                    if res.status != "OK":
+                        print(f"{method.name:32} | {res.status:5} | {'-':>8} | {'-':>8} | {'-':>17} | {'-':>11} | {res.message}")
+                        continue
+                    speedup = baseline_ms / res.ms if (baseline_ms is not None and res.ms and res.ms > 0) else None
+                    ms_str = f"{res.ms:.3f}" if res.ms is not None else "-"
+                    tflops_str = f"{res.tflops:.2f}" if res.tflops is not None else "-"
+                    speedup_str = f"{speedup:.3f}" if speedup is not None else "-"
+                    err_str = f"{res.max_abs_err:.4e}" if res.max_abs_err is not None else "n/a"
+                    print(
+                        f"{method.name:32} | {res.status:5} | {ms_str:>8} | {tflops_str:>8} | "
+                        f"{speedup_str:>17} | {err_str:>11} | {method.note}"
+                    )
 
 
 if __name__ == "__main__":
