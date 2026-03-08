@@ -5,7 +5,7 @@ import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Any, Callable, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -19,6 +19,8 @@ class BenchMethod:
     name: str
     group: str
     fn: TensorFn
+    input_format: str = "NHD[B,S,H,D]"
+    output_format: str = "NHD"
     note: str = ""
 
 
@@ -136,7 +138,8 @@ def benchmark_kernel(
     warmup: int,
     iters: int,
 ) -> tuple[torch.Tensor, float]:
-    out = None
+    # Always run one untimed setup call so one-time input preparation is never charged to kernel runtime.
+    out = unwrap_output(fn(q, k, v, causal))
     for _ in range(warmup):
         out = unwrap_output(fn(q, k, v, causal))
     torch.cuda.synchronize()
@@ -199,31 +202,139 @@ def _as_varlen_nhd(
     return q_flat, k_flat, v_flat, cu_seqlens, seq
 
 
-def _fa_kvcache_wrapper(
-    fa_with_kvcache: Callable,
+def _make_cache_key(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[Any, ...]:
+    return (
+        q.data_ptr(),
+        k.data_ptr(),
+        v.data_ptr(),
+        q.shape,
+        k.shape,
+        v.shape,
+        q.dtype,
+        k.dtype,
+        v.dtype,
+        q.device,
+        k.device,
+        v.device,
+    )
+
+
+def _cached_prepare(
+    prepare: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], Any],
+    run_prepared: Callable[[Any, bool], torch.Tensor],
+) -> TensorFn:
+    cache_key: Optional[tuple[Any, ...]] = None
+    cache_value: Any = None
+
+    def wrapper(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool) -> torch.Tensor:
+        nonlocal cache_key, cache_value
+        key = _make_cache_key(q, k, v)
+        if key != cache_key:
+            cache_value = prepare(q, k, v)
+            cache_key = key
+        return run_prepared(cache_value, causal)
+
+    return wrapper
+
+
+def _to_hnd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    causal: bool,
-) -> torch.Tensor:
-    # Use empty cache + (k, v) append so each invocation is self-contained.
-    k_cache = torch.empty_like(k)
-    v_cache = torch.empty_like(v)
-    return fa_with_kvcache(q, k_cache, v_cache, k=k, v=v, cache_seqlens=0, causal=causal)
+    make_contiguous: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    q_hnd = q.permute(0, 2, 1, 3)
+    k_hnd = k.permute(0, 2, 1, 3)
+    v_hnd = v.permute(0, 2, 1, 3)
+    if make_contiguous:
+        q_hnd = q_hnd.contiguous()
+        k_hnd = k_hnd.contiguous()
+        v_hnd = v_hnd.contiguous()
+    return q_hnd, k_hnd, v_hnd
 
 
 def build_methods(arch: str) -> tuple[list[BenchMethod], list[str]]:
     methods: list[BenchMethod] = []
     availability_notes: list[str] = []
 
+    def _prepare_nhd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        return q, k, v
+
+    def _add_sage_layout_variants(
+        base_name: str,
+        make_call: Callable[[str], Callable[[torch.Tensor, torch.Tensor, torch.Tensor, bool], torch.Tensor]],
+        note: str = "",
+    ) -> None:
+        nhd_call = make_call("NHD")
+        hnd_call = make_call("HND")
+        methods.append(
+            BenchMethod(
+                name=f"{base_name}.nhd",
+                group="sage",
+                fn=_cached_prepare(
+                    _prepare_nhd,
+                    lambda prepared, causal, nhd_call=nhd_call: nhd_call(
+                        prepared[0], prepared[1], prepared[2], causal
+                    ),
+                ),
+                input_format="NHD[B,S,H,D]",
+                output_format="NHD",
+                note=note,
+            )
+        )
+        methods.append(
+            BenchMethod(
+                name=f"{base_name}.hnd",
+                group="sage",
+                fn=_cached_prepare(
+                    lambda q, k, v: _to_hnd(q, k, v),
+                    lambda prepared, causal, hnd_call=hnd_call: hnd_call(
+                        prepared[0], prepared[1], prepared[2], causal
+                    ),
+                ),
+                input_format="HND[B,H,S,D]",
+                output_format="HND",
+                note=note,
+            )
+        )
+
     methods.append(
         BenchMethod(
             name="torch.sdpa",
             group="torch",
-            fn=lambda q, k, v, causal: sdpa_reference(q, k, v, causal),
+            fn=_cached_prepare(
+                lambda q, k, v: _to_hnd(q, k, v),
+                lambda prepared, causal: F.scaled_dot_product_attention(
+                    prepared[0], prepared[1], prepared[2], is_causal=causal
+                ),
+            ),
+            input_format="HND[B,H,S,D]",
+            output_format="HND",
             note="PyTorch reference",
         )
     )
+
+    tile_mod, tile_err = import_optional("cuTile.cuTile_flash_attn")
+    if tile_mod is None:
+        availability_notes.append(f"skip cuTile tile_fmha: {tile_err}")
+    elif hasattr(tile_mod, "tile_fmha"):
+        methods.append(
+            BenchMethod(
+                name="tile.fmha",
+                group="tile",
+                fn=_cached_prepare(
+                    lambda q, k, v: _to_hnd(q, k, v),
+                    lambda prepared, causal: tile_mod.tile_fmha(
+                        prepared[0], prepared[1], prepared[2], is_causal=causal
+                    ),
+                ),
+                input_format="HND[B,H,S,D]",
+                output_format="HND",
+                note="cuTile FlashAttention kernel",
+            )
+        )
+    else:
+        availability_notes.append("skip cuTile tile_fmha: missing tile_fmha symbol")
 
     flash_mod, flash_err = import_optional("flash_attn")
     if flash_mod is None:
@@ -234,74 +345,130 @@ def build_methods(arch: str) -> tuple[list[BenchMethod], list[str]]:
                 BenchMethod(
                     name="flash.fa2",
                     group="flash",
-                    fn=lambda q, k, v, causal: flash_mod.flash_attn_func(q, k, v, causal=causal),
+                    fn=_cached_prepare(
+                        _prepare_nhd,
+                        lambda prepared, causal: flash_mod.flash_attn_func(
+                            prepared[0], prepared[1], prepared[2], causal=causal
+                        ),
+                    ),
+                    input_format="NHD[B,S,H,D]",
                 )
             )
         if hasattr(flash_mod, "flash_attn_qkvpacked_func"):
-
-            def fa2_qkvpacked(q, k, v, causal):
-                qkv = torch.stack((q, k, v), dim=2)
-                return flash_mod.flash_attn_qkvpacked_func(qkv, causal=causal)
-
-            methods.append(BenchMethod(name="flash.fa2_qkvpacked", group="flash", fn=fa2_qkvpacked))
+            methods.append(
+                BenchMethod(
+                    name="flash.fa2_qkvpacked",
+                    group="flash",
+                    fn=_cached_prepare(
+                        lambda q, k, v: torch.stack((q, k, v), dim=2).contiguous(),
+                        lambda qkv, causal: flash_mod.flash_attn_qkvpacked_func(qkv, causal=causal),
+                    ),
+                    input_format="NHD_qkv[B,S,3,H,D]",
+                )
+            )
         if hasattr(flash_mod, "flash_attn_kvpacked_func"):
-
-            def fa2_kvpacked(q, k, v, causal):
-                kv = torch.stack((k, v), dim=2)
-                return flash_mod.flash_attn_kvpacked_func(q, kv, causal=causal)
-
-            methods.append(BenchMethod(name="flash.fa2_kvpacked", group="flash", fn=fa2_kvpacked))
+            methods.append(
+                BenchMethod(
+                    name="flash.fa2_kvpacked",
+                    group="flash",
+                    fn=_cached_prepare(
+                        lambda q, k, v: (q, torch.stack((k, v), dim=2).contiguous()),
+                        lambda prepared, causal: flash_mod.flash_attn_kvpacked_func(
+                            prepared[0], prepared[1], causal=causal
+                        ),
+                    ),
+                    input_format="NHD_kv[B,S,2,H,D]",
+                )
+            )
         if hasattr(flash_mod, "flash_attn_varlen_func"):
-
-            def fa2_varlen(q, k, v, causal):
-                q_flat, k_flat, v_flat, cu_seqlens, max_seqlen = _as_varlen_nhd(q, k, v)
-                out = flash_mod.flash_attn_varlen_func(
-                    q_flat,
-                    k_flat,
-                    v_flat,
-                    cu_seqlens,
-                    cu_seqlens,
-                    max_seqlen,
-                    max_seqlen,
-                    causal=causal,
+            methods.append(
+                BenchMethod(
+                    name="flash.fa2_varlen",
+                    group="flash",
+                    fn=_cached_prepare(
+                        _as_varlen_nhd,
+                        lambda prepared, causal: flash_mod.flash_attn_varlen_func(
+                            prepared[0],
+                            prepared[1],
+                            prepared[2],
+                            prepared[3],
+                            prepared[3],
+                            prepared[4],
+                            prepared[4],
+                            causal=causal,
+                        ),
+                    ),
+                    input_format="varlen[total,H,D]",
+                    output_format="varlen",
                 )
-                return out.reshape_as(q)
-
-            methods.append(BenchMethod(name="flash.fa2_varlen", group="flash", fn=fa2_varlen))
+            )
         if hasattr(flash_mod, "flash_attn_varlen_qkvpacked_func"):
-
-            def fa2_varlen_qkvpacked(q, k, v, causal):
+            def _prepare_fa2_varlen_qkvpacked(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
                 q_flat, k_flat, v_flat, cu_seqlens, max_seqlen = _as_varlen_nhd(q, k, v)
-                qkv = torch.stack((q_flat, k_flat, v_flat), dim=1)
-                out = flash_mod.flash_attn_varlen_qkvpacked_func(qkv, cu_seqlens, max_seqlen, causal=causal)
-                return out.reshape_as(q)
+                qkv = torch.stack((q_flat, k_flat, v_flat), dim=1).contiguous()
+                return qkv, cu_seqlens, max_seqlen
 
-            methods.append(BenchMethod(name="flash.fa2_varlen_qkvpacked", group="flash", fn=fa2_varlen_qkvpacked))
-        if hasattr(flash_mod, "flash_attn_varlen_kvpacked_func"):
-
-            def fa2_varlen_kvpacked(q, k, v, causal):
-                q_flat, k_flat, v_flat, cu_seqlens, max_seqlen = _as_varlen_nhd(q, k, v)
-                kv = torch.stack((k_flat, v_flat), dim=1)
-                out = flash_mod.flash_attn_varlen_kvpacked_func(
-                    q_flat,
-                    kv,
-                    cu_seqlens,
-                    cu_seqlens,
-                    max_seqlen,
-                    max_seqlen,
-                    causal=causal,
+            methods.append(
+                BenchMethod(
+                    name="flash.fa2_varlen_qkvpacked",
+                    group="flash",
+                    fn=_cached_prepare(
+                        _prepare_fa2_varlen_qkvpacked,
+                        lambda prepared, causal: flash_mod.flash_attn_varlen_qkvpacked_func(
+                            prepared[0],
+                            prepared[1],
+                            prepared[2],
+                            causal=causal,
+                        ),
+                    ),
+                    input_format="varlen_qkv[total,3,H,D]",
+                    output_format="varlen",
                 )
-                return out.reshape_as(q)
+            )
+        if hasattr(flash_mod, "flash_attn_varlen_kvpacked_func"):
+            def _prepare_fa2_varlen_kvpacked(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+                q_flat, k_flat, v_flat, cu_seqlens, max_seqlen = _as_varlen_nhd(q, k, v)
+                kv = torch.stack((k_flat, v_flat), dim=1).contiguous()
+                return q_flat, kv, cu_seqlens, max_seqlen
 
-            methods.append(BenchMethod(name="flash.fa2_varlen_kvpacked", group="flash", fn=fa2_varlen_kvpacked))
+            methods.append(
+                BenchMethod(
+                    name="flash.fa2_varlen_kvpacked",
+                    group="flash",
+                    fn=_cached_prepare(
+                        _prepare_fa2_varlen_kvpacked,
+                        lambda prepared, causal: flash_mod.flash_attn_varlen_kvpacked_func(
+                            prepared[0],
+                            prepared[1],
+                            prepared[2],
+                            prepared[2],
+                            prepared[3],
+                            prepared[3],
+                            causal=causal,
+                        ),
+                    ),
+                    input_format="varlen_kv[total,2,H,D]",
+                    output_format="varlen",
+                )
+            )
         if hasattr(flash_mod, "flash_attn_with_kvcache"):
             methods.append(
                 BenchMethod(
                     name="flash.fa2_kvcache",
                     group="flash",
-                    fn=lambda q, k, v, causal: _fa_kvcache_wrapper(
-                        flash_mod.flash_attn_with_kvcache, q, k, v, causal
+                    fn=_cached_prepare(
+                        lambda q, k, v: (q, k, v, torch.empty_like(k), torch.empty_like(v)),
+                        lambda prepared, causal: flash_mod.flash_attn_with_kvcache(
+                            prepared[0],
+                            prepared[3],
+                            prepared[4],
+                            k=prepared[1],
+                            v=prepared[2],
+                            cache_seqlens=0,
+                            causal=causal,
+                        ),
                     ),
+                    input_format="NHD[B,S,H,D]+cache",
                 )
             )
 
@@ -313,30 +480,35 @@ def build_methods(arch: str) -> tuple[list[BenchMethod], list[str]]:
             BenchMethod(
                 name="flash.fa2_interface",
                 group="flash",
-                fn=lambda q, k, v, causal: fa2_iface.flash_attn_func(q, k, v, causal=causal),
+                fn=_cached_prepare(
+                    _prepare_nhd,
+                    lambda prepared, causal: fa2_iface.flash_attn_func(
+                        prepared[0], prepared[1], prepared[2], causal=causal
+                    ),
+                ),
+                input_format="NHD[B,S,H,D]",
             )
         )
         if hasattr(fa2_iface, "flash_attn_varlen_func"):
-
-            def fa2_interface_varlen(q, k, v, causal):
-                q_flat, k_flat, v_flat, cu_seqlens, max_seqlen = _as_varlen_nhd(q, k, v)
-                out = fa2_iface.flash_attn_varlen_func(
-                    q_flat,
-                    k_flat,
-                    v_flat,
-                    cu_seqlens,
-                    cu_seqlens,
-                    max_seqlen,
-                    max_seqlen,
-                    causal=causal,
-                )
-                return out.reshape_as(q)
-
             methods.append(
                 BenchMethod(
                     name="flash.fa2_interface_varlen",
                     group="flash",
-                    fn=fa2_interface_varlen,
+                    fn=_cached_prepare(
+                        _as_varlen_nhd,
+                        lambda prepared, causal: fa2_iface.flash_attn_varlen_func(
+                            prepared[0],
+                            prepared[1],
+                            prepared[2],
+                            prepared[3],
+                            prepared[3],
+                            prepared[4],
+                            prepared[4],
+                            causal=causal,
+                        ),
+                    ),
+                    input_format="varlen[total,H,D]",
+                    output_format="varlen",
                 )
             )
         if hasattr(fa2_iface, "flash_attn_with_kvcache"):
@@ -344,9 +516,19 @@ def build_methods(arch: str) -> tuple[list[BenchMethod], list[str]]:
                 BenchMethod(
                     name="flash.fa2_interface_kvcache",
                     group="flash",
-                    fn=lambda q, k, v, causal: _fa_kvcache_wrapper(
-                        fa2_iface.flash_attn_with_kvcache, q, k, v, causal
+                    fn=_cached_prepare(
+                        lambda q, k, v: (q, k, v, torch.empty_like(k), torch.empty_like(v)),
+                        lambda prepared, causal: fa2_iface.flash_attn_with_kvcache(
+                            prepared[0],
+                            prepared[3],
+                            prepared[4],
+                            k=prepared[1],
+                            v=prepared[2],
+                            cache_seqlens=0,
+                            causal=causal,
+                        ),
                     ),
+                    input_format="NHD[B,S,H,D]+cache",
                 )
             )
 
@@ -358,7 +540,13 @@ def build_methods(arch: str) -> tuple[list[BenchMethod], list[str]]:
             BenchMethod(
                 name="flash.cute",
                 group="flash",
-                fn=lambda q, k, v, causal: fa_cute.flash_attn_func(q, k, v, causal=causal),
+                fn=_cached_prepare(
+                    _prepare_nhd,
+                    lambda prepared, causal: fa_cute.flash_attn_func(
+                        prepared[0], prepared[1], prepared[2], causal=causal
+                    ),
+                ),
+                input_format="NHD[B,S,H,D]",
                 note="CuTe interface",
             )
         )
@@ -370,7 +558,13 @@ def build_methods(arch: str) -> tuple[list[BenchMethod], list[str]]:
             BenchMethod(
                 name="flash.cute_api",
                 group="flash",
-                fn=lambda q, k, v, causal: fa4_api.flash_attn_func(q, k, v, causal=causal),
+                fn=_cached_prepare(
+                    _prepare_nhd,
+                    lambda prepared, causal: fa4_api.flash_attn_func(
+                        prepared[0], prepared[1], prepared[2], causal=causal
+                    ),
+                ),
+                input_format="NHD[B,S,H,D]",
                 note="CuTe package API (from flash_attn.cute import flash_attn_func)",
             )
         )
@@ -384,159 +578,189 @@ def build_methods(arch: str) -> tuple[list[BenchMethod], list[str]]:
                 BenchMethod(
                     name="flash.fa3",
                     group="flash",
-                    fn=lambda q, k, v, causal: fa3_mod.flash_attn_func(q, k, v, causal=causal),
+                    fn=_cached_prepare(
+                        _prepare_nhd,
+                        lambda prepared, causal: fa3_mod.flash_attn_func(
+                            prepared[0], prepared[1], prepared[2], causal=causal
+                        ),
+                    ),
+                    input_format="NHD[B,S,H,D]",
                 )
             )
         if hasattr(fa3_mod, "flash_attn_qkvpacked_func"):
-
-            def fa3_qkvpacked(q, k, v, causal):
-                qkv = torch.stack((q, k, v), dim=2)
-                return fa3_mod.flash_attn_qkvpacked_func(qkv, causal=causal)
-
-            methods.append(BenchMethod(name="flash.fa3_qkvpacked", group="flash", fn=fa3_qkvpacked))
-        if hasattr(fa3_mod, "flash_attn_varlen_func"):
-
-            def fa3_varlen(q, k, v, causal):
-                q_flat, k_flat, v_flat, cu_seqlens, max_seqlen = _as_varlen_nhd(q, k, v)
-                out = fa3_mod.flash_attn_varlen_func(
-                    q_flat,
-                    k_flat,
-                    v_flat,
-                    cu_seqlens,
-                    cu_seqlens,
-                    max_seqlen,
-                    max_seqlen,
-                    causal=causal,
+            methods.append(
+                BenchMethod(
+                    name="flash.fa3_qkvpacked",
+                    group="flash",
+                    fn=_cached_prepare(
+                        lambda q, k, v: torch.stack((q, k, v), dim=2).contiguous(),
+                        lambda qkv, causal: fa3_mod.flash_attn_qkvpacked_func(qkv, causal=causal),
+                    ),
+                    input_format="NHD_qkv[B,S,3,H,D]",
                 )
-                return out.reshape_as(q)
-
-            methods.append(BenchMethod(name="flash.fa3_varlen", group="flash", fn=fa3_varlen))
+            )
+        if hasattr(fa3_mod, "flash_attn_varlen_func"):
+            methods.append(
+                BenchMethod(
+                    name="flash.fa3_varlen",
+                    group="flash",
+                    fn=_cached_prepare(
+                        _as_varlen_nhd,
+                        lambda prepared, causal: fa3_mod.flash_attn_varlen_func(
+                            prepared[0],
+                            prepared[1],
+                            prepared[2],
+                            prepared[3],
+                            prepared[3],
+                            prepared[4],
+                            prepared[4],
+                            causal=causal,
+                        ),
+                    ),
+                    input_format="varlen[total,H,D]",
+                    output_format="varlen",
+                )
+            )
         if hasattr(fa3_mod, "flash_attn_with_kvcache"):
             methods.append(
                 BenchMethod(
                     name="flash.fa3_kvcache",
                     group="flash",
-                    fn=lambda q, k, v, causal: _fa_kvcache_wrapper(
-                        fa3_mod.flash_attn_with_kvcache, q, k, v, causal
+                    fn=_cached_prepare(
+                        lambda q, k, v: (q, k, v, torch.empty_like(k), torch.empty_like(v)),
+                        lambda prepared, causal: fa3_mod.flash_attn_with_kvcache(
+                            prepared[0],
+                            prepared[3],
+                            prepared[4],
+                            k=prepared[1],
+                            v=prepared[2],
+                            cache_seqlens=0,
+                            causal=causal,
+                        ),
                     ),
+                    input_format="NHD[B,S,H,D]+cache",
                 )
             )
         if hasattr(fa3_mod, "flash_attn_func") and hasattr(torch, "float8_e4m3fn"):
-
-            def fa3_fp8(q, k, v, causal):
-                q_fp8 = q.to(torch.float8_e4m3fn)
-                k_fp8 = k.to(torch.float8_e4m3fn)
-                v_fp8 = v.to(torch.float8_e4m3fn)
-                # FA3 expects 2D descale tensors, with Q using query heads and K/V using KV heads.
-                q_descale = torch.ones((q.shape[0], q.shape[2]), dtype=torch.float32, device=q.device)
-                kv_descale = torch.ones((k.shape[0], k.shape[2]), dtype=torch.float32, device=q.device)
-                return fa3_mod.flash_attn_func(
-                    q_fp8,
-                    k_fp8,
-                    v_fp8,
-                    softmax_scale=q.shape[-1] ** -0.5,
-                    causal=causal,
-                    q_descale=q_descale,
-                    k_descale=kv_descale,
-                    v_descale=kv_descale,
+            methods.append(
+                BenchMethod(
+                    name="flash.fa3_fp8",
+                    group="flash",
+                    fn=_cached_prepare(
+                        lambda q, k, v: (
+                            q.to(torch.float8_e4m3fn),
+                            k.to(torch.float8_e4m3fn),
+                            v.to(torch.float8_e4m3fn),
+                            torch.ones((q.shape[0], q.shape[2]), dtype=torch.float32, device=q.device),
+                            torch.ones((k.shape[0], k.shape[2]), dtype=torch.float32, device=q.device),
+                            q.shape[-1] ** -0.5,
+                        ),
+                        lambda prepared, causal: fa3_mod.flash_attn_func(
+                            prepared[0],
+                            prepared[1],
+                            prepared[2],
+                            softmax_scale=prepared[5],
+                            causal=causal,
+                            q_descale=prepared[3],
+                            k_descale=prepared[4],
+                            v_descale=prepared[4],
+                        ),
+                    ),
+                    input_format="NHD_fp8[B,S,H,D]",
+                    note="FA3 FP8 fwd",
                 )
-
-            methods.append(BenchMethod(name="flash.fa3_fp8", group="flash", fn=fa3_fp8, note="FA3 FP8 fwd"))
+            )
 
     sage_mod, sage_err = import_optional("sageattention")
     if sage_mod is None:
         availability_notes.append(f"skip sageattention: {sage_err}")
     else:
         if hasattr(sage_mod, "sageattn"):
-            methods.append(
-                BenchMethod(
-                    name="sage.auto",
-                    group="sage",
-                    fn=lambda q, k, v, causal: sage_mod.sageattn(
-                        q, k, v, tensor_layout="NHD", is_causal=causal
-                    ),
-                )
+            _add_sage_layout_variants(
+                "sage.auto",
+                lambda layout: lambda q, k, v, causal: sage_mod.sageattn(
+                    q, k, v, tensor_layout=layout, is_causal=causal
+                ),
             )
         if hasattr(sage_mod, "sageattn_varlen"):
-
-            def sage_varlen(q, k, v, causal):
-                q_flat, k_flat, v_flat, cu_seqlens, max_seqlen = _as_varlen_nhd(q, k, v)
-                out = sage_mod.sageattn_varlen(
-                    q_flat,
-                    k_flat,
-                    v_flat,
-                    cu_seqlens_q=cu_seqlens,
-                    cu_seqlens_k=cu_seqlens,
-                    max_seqlen_q=max_seqlen,
-                    max_seqlen_k=max_seqlen,
-                    is_causal=causal,
-                )
-                return out.reshape_as(q)
-
-            methods.append(BenchMethod(name="sage.varlen", group="sage", fn=sage_varlen))
-        if hasattr(sage_mod, "sageattn_qk_int8_pv_fp16_triton"):
             methods.append(
                 BenchMethod(
-                    name="sage.fp16_triton",
+                    name="sage.varlen",
                     group="sage",
-                    fn=lambda q, k, v, causal: sage_mod.sageattn_qk_int8_pv_fp16_triton(
-                        q, k, v, tensor_layout="NHD", is_causal=causal
+                    fn=_cached_prepare(
+                        _as_varlen_nhd,
+                        lambda prepared, causal: sage_mod.sageattn_varlen(
+                            prepared[0],
+                            prepared[1],
+                            prepared[2],
+                            cu_seqlens_q=prepared[3],
+                            cu_seqlens_k=prepared[3],
+                            max_seqlen_q=prepared[4],
+                            max_seqlen_k=prepared[4],
+                            is_causal=causal,
+                        ),
                     ),
+                    input_format="varlen[total,H,D]",
+                    output_format="varlen",
                 )
+            )
+        if hasattr(sage_mod, "sageattn_qk_int8_pv_fp16_triton"):
+            _add_sage_layout_variants(
+                "sage.fp16_triton",
+                lambda layout: lambda q, k, v, causal: sage_mod.sageattn_qk_int8_pv_fp16_triton(
+                    q, k, v, tensor_layout=layout, is_causal=causal
+                ),
             )
         if hasattr(sage_mod, "sageattn_qk_int8_pv_fp16_cuda"):
             for qgran in ("per_thread", "per_warp"):
                 for accum in ("fp16", "fp16+fp32", "fp32"):
-                    methods.append(
-                        BenchMethod(
-                            name=f"sage.fp16_cuda.{qgran}.{accum}",
-                            group="sage",
-                            fn=lambda q, k, v, causal, qgran=qgran, accum=accum: sage_mod.sageattn_qk_int8_pv_fp16_cuda(
+                    _add_sage_layout_variants(
+                        f"sage.fp16_cuda.{qgran}.{accum}",
+                        lambda layout, qgran=qgran, accum=accum: (
+                            lambda q, k, v, causal: sage_mod.sageattn_qk_int8_pv_fp16_cuda(
                                 q,
                                 k,
                                 v,
-                                tensor_layout="NHD",
+                                tensor_layout=layout,
                                 is_causal=causal,
                                 qk_quant_gran=qgran,
                                 pv_accum_dtype=accum,
-                            ),
-                        )
+                            )
+                        ),
                     )
         if hasattr(sage_mod, "sageattn_qk_int8_pv_fp8_cuda"):
             for qgran in ("per_thread", "per_warp"):
                 for accum in ("fp32", "fp32+fp32", "fp32+fp16"):
-                    methods.append(
-                        BenchMethod(
-                            name=f"sage.fp8_cuda.{qgran}.{accum}",
-                            group="sage",
-                            fn=lambda q, k, v, causal, qgran=qgran, accum=accum: sage_mod.sageattn_qk_int8_pv_fp8_cuda(
+                    _add_sage_layout_variants(
+                        f"sage.fp8_cuda.{qgran}.{accum}",
+                        lambda layout, qgran=qgran, accum=accum: (
+                            lambda q, k, v, causal: sage_mod.sageattn_qk_int8_pv_fp8_cuda(
                                 q,
                                 k,
                                 v,
-                                tensor_layout="NHD",
+                                tensor_layout=layout,
                                 is_causal=causal,
                                 qk_quant_gran=qgran,
                                 pv_accum_dtype=accum,
-                            ),
-                        )
+                            )
+                        ),
                     )
         if hasattr(sage_mod, "sageattn_qk_int8_pv_fp8_cuda_sm90"):
             for qgran in ("per_thread", "per_warp"):
                 for accum in ("fp32", "fp32+fp32"):
-                    methods.append(
-                        BenchMethod(
-                            name=f"sage.fp8_cuda_sm90.{qgran}.{accum}",
-                            group="sage",
-                            fn=lambda q, k, v, causal, qgran=qgran, accum=accum: sage_mod.sageattn_qk_int8_pv_fp8_cuda_sm90(
+                    _add_sage_layout_variants(
+                        f"sage.fp8_cuda_sm90.{qgran}.{accum}",
+                        lambda layout, qgran=qgran, accum=accum: (
+                            lambda q, k, v, causal: sage_mod.sageattn_qk_int8_pv_fp8_cuda_sm90(
                                 q,
                                 k,
                                 v,
-                                tensor_layout="NHD",
+                                tensor_layout=layout,
                                 is_causal=causal,
                                 qk_quant_gran=qgran,
                                 pv_accum_dtype=accum,
-                            ),
-                        )
+                            )
+                        ),
                     )
     availability_notes.append(f"registered {len(methods)} candidate methods for arch={arch}")
     return methods, availability_notes
@@ -564,7 +788,15 @@ def run_single_method(
         out, ms = benchmark_kernel(method.fn, q, k, v, causal, warmup, iters)
         result = BenchResult(status="OK", ms=ms)
         if ref is not None:
-            result.max_abs_err = (out.to(torch.float32) - ref).abs().max().item()
+            if method.output_format == "NHD":
+                out_ref = out
+            elif method.output_format == "HND":
+                out_ref = out.permute(0, 2, 1, 3).contiguous()
+            elif method.output_format == "varlen":
+                out_ref = out.reshape_as(q)
+            else:
+                raise ValueError(f"Unsupported output format for {method.name}: {method.output_format}")
+            result.max_abs_err = (out_ref.to(torch.float32) - ref).abs().max().item()
         return result
     except Exception as exc:
         msg = str(exc).lower()
@@ -726,8 +958,8 @@ def main() -> None:
                     f"warmup={args.warmup} iters={args.iters} baseline={baseline_name or 'n/a'} "
                     f"(requested={args.baseline})"
                 )
-                print("method | status | ms | tflops | speedup_vs_baseline | max_abs_err | note")
-                print("-" * 140)
+                print("method | input_format | status | ms | tflops | speedup_vs_baseline | max_abs_err | note")
+                print("-" * 180)
                 sorted_methods = sorted(
                     methods,
                     key=lambda method: (
@@ -739,7 +971,10 @@ def main() -> None:
                 for method in sorted_methods:
                     res = per_method[method.name]
                     if res.status != "OK":
-                        print(f"{method.name:32} | {res.status:5} | {'-':>8} | {'-':>8} | {'-':>17} | {'-':>11} | {res.message}")
+                        print(
+                            f"{method.name:32} | {method.input_format:22} | {res.status:5} | {'-':>8} | {'-':>8} | "
+                            f"{'-':>17} | {'-':>11} | {res.message}"
+                        )
                         continue
                     speedup = baseline_ms / res.ms if (baseline_ms is not None and res.ms and res.ms > 0) else None
                     ms_str = f"{res.ms:.3f}" if res.ms is not None else "-"
@@ -747,7 +982,7 @@ def main() -> None:
                     speedup_str = f"{speedup:.3f}" if speedup is not None else "-"
                     err_str = f"{res.max_abs_err:.4e}" if res.max_abs_err is not None else "n/a"
                     print(
-                        f"{method.name:32} | {res.status:5} | {ms_str:>8} | {tflops_str:>8} | "
+                        f"{method.name:32} | {method.input_format:22} | {res.status:5} | {ms_str:>8} | {tflops_str:>8} | "
                         f"{speedup_str:>17} | {err_str:>11} | {method.note}"
                     )
 

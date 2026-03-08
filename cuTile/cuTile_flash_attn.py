@@ -223,7 +223,7 @@ def autotune_launch_fmha(
 import torch
 from math import ceil
  
-def tile_fmha(q, k, v, sm_scale=None, is_causal=True):
+def tile_fmha(q, k, v, sm_scale=None, is_causal=False):
     """
     Launch the Flash Attention kernel.
      
@@ -267,7 +267,7 @@ if __name__ == "__main__":
         q,
         k,
         v,
-        is_causal=True,
+        is_causal=False,
         warmup=5,
         iters=20,
     ):
@@ -303,7 +303,7 @@ if __name__ == "__main__":
             q,
             k,
             v,
-            is_causal=True,
+            is_causal=False,
         )
 
         print(f"  Elapsed_time ({avg_ms:.3f} ms), tflops: {2 * batch * heads * seq_len * head_dim * seq_len / (avg_ms * 1e6):.2f} TFLOPS")
