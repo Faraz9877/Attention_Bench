@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import csv
 import importlib
 import json
 import sys
@@ -855,6 +856,12 @@ def main() -> None:
         default="flash.fa2",
         help="Method name used for speedup column when available.",
     )
+    parser.add_argument(
+        "--results-csv",
+        type=str,
+        default="results.csv",
+        help="Path to CSV output file (only successful methods are written).",
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -904,6 +911,8 @@ def main() -> None:
 
     if not methods:
         raise RuntimeError("No methods selected.")
+
+    csv_rows: list[dict[str, Any]] = []
 
     if args.causal_only:
         causal_modes = [True]
@@ -985,6 +994,67 @@ def main() -> None:
                         f"{method.name:32} | {method.input_format:22} | {res.status:5} | {ms_str:>8} | {tflops_str:>8} | "
                         f"{speedup_str:>17} | {err_str:>11} | {method.note}"
                     )
+                    csv_rows.append(
+                        {
+                            "model": model.name,
+                            "causal": causal,
+                            "seq_len": seq,
+                            "batch_size": model.batch_size,
+                            "num_heads": model.num_heads,
+                            "num_kv_heads": kv_heads,
+                            "head_dim": model.head_dim,
+                            "dtype": args.dtype,
+                            "warmup": args.warmup,
+                            "iters": args.iters,
+                            "gpu_arch": arch,
+                            "method": method.name,
+                            "group": method.group,
+                            "input_format": method.input_format,
+                            "output_format": method.output_format,
+                            "status": res.status,
+                            "ms": res.ms,
+                            "tflops": res.tflops,
+                            "speedup_vs_baseline": speedup,
+                            "max_abs_err": res.max_abs_err,
+                            "baseline_requested": args.baseline,
+                            "baseline_used": baseline_name,
+                            "note": method.note,
+                        }
+                    )
+
+    csv_path = Path(args.results_csv)
+    if csv_path.parent != Path("."):
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "model",
+        "causal",
+        "seq_len",
+        "batch_size",
+        "num_heads",
+        "num_kv_heads",
+        "head_dim",
+        "dtype",
+        "warmup",
+        "iters",
+        "gpu_arch",
+        "method",
+        "group",
+        "input_format",
+        "output_format",
+        "status",
+        "ms",
+        "tflops",
+        "speedup_vs_baseline",
+        "max_abs_err",
+        "baseline_requested",
+        "baseline_used",
+        "note",
+    ]
+    with csv_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(csv_rows)
+    print(f"\n[info] wrote {len(csv_rows)} successful rows to {csv_path}")
 
 
 if __name__ == "__main__":

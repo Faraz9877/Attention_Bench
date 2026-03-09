@@ -1,3 +1,5 @@
 .venv
 **pycache**
 uv.lock
+*.csv
+*.png

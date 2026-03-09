@@ -75,6 +75,13 @@ To include numerical checks against `torch.nn.functional.scaled_dot_product_atte
 .venv/bin/python benchmark_sage_vs_flash.py --check
 ```
 
+Each run writes successful (`OK`) method rows to `results.csv` by default for plotting.
+You can change the path with:
+
+```bash
+.venv/bin/python benchmark_sage_vs_flash.py --results-csv /path/to/results.csv
+```
+
 To run both non-causal and causal tables:
 
 ```bash
@@ -85,6 +92,12 @@ To run only causal tables:
 
 ```bash
 .venv/bin/python benchmark_sage_vs_flash.py --causal-only
+```
+
+Plot the CSV results (one vertical subplot per model, top-6 methods per sequence length):
+
+```bash
+.venv/bin/python plot_results.py --input results.csv --output results_plot.png --top-n 6 --causal false
 ```
 
 ## Notes
