@@ -17,6 +17,24 @@ def parse_bool(s: str) -> bool:
     raise ValueError(f"Invalid boolean value: {s}")
 
 
+def marker_for_method(method: str) -> str:
+    lower = method.lower()
+    if "torch" in lower or "cute" in lower:
+        return "^"
+    if "sage" in lower:
+        return "s"
+    return "o"
+
+
+def category_for_method(method: str) -> str:
+    lower = method.lower()
+    if "torch" in lower or "cute" in lower:
+        return "torch_cute"
+    if "sage" in lower:
+        return "sage"
+    return "other"
+
+
 def load_rows(csv_path: Path, causal_filter: str) -> list[dict]:
     with csv_path.open(newline="") as f:
         reader = csv.DictReader(f)
@@ -34,6 +52,7 @@ def load_rows(csv_path: Path, causal_filter: str) -> list[dict]:
             {
                 "model": row["model"],
                 "method": row["method"],
+                "category": category_for_method(row["method"]),
                 "seq_len": int(row["seq_len"]),
                 "tflops": float(row["tflops"]),
             }
@@ -53,7 +72,15 @@ def build_topn_series(rows: list[dict], top_n: int):
         top_rows_by_seq: dict[int, list[dict]] = {}
         top_methods_union: set[str] = set()
         for seq in seq_lens:
-            top_rows = sorted(seq_map[seq], key=lambda r: r["tflops"], reverse=True)[:top_n]
+            category_rows: dict[str, list[dict]] = defaultdict(list)
+            for row in seq_map[seq]:
+                category_rows[row["category"]].append(row)
+
+            top_rows: list[dict] = []
+            for category in ("torch_cute", "sage", "other"):
+                top_rows.extend(
+                    sorted(category_rows[category], key=lambda r: r["tflops"], reverse=True)[:top_n]
+                )
             top_rows_by_seq[seq] = top_rows
             for r in top_rows:
                 top_methods_union.add(r["method"])
@@ -101,9 +128,9 @@ def plot_results(model_plot_data: dict[str, dict], output_path: Path, top_n: int
         x = list(range(len(seq_lens)))
         for method in data["method_order"]:
             y = data["method_series"][method]
-            ax.plot(x, y, marker="o", linewidth=1.8, label=method)
+            ax.plot(x, y, marker=marker_for_method(method), linewidth=1.8, label=method)
 
-        ax.set_title(f"{model} (top {top_n} per sequence)")
+        ax.set_title(f"{model} (top {top_n} per category per sequence)")
         ax.set_ylabel("TFLOPs")
         ax.set_xticks(x)
         ax.set_xticklabels([str(v) for v in seq_lens])
@@ -123,7 +150,7 @@ def main() -> None:
     )
     parser.add_argument("--input", type=str, default="results.csv", help="Path to results CSV.")
     parser.add_argument("--output", type=str, default="results_plot.png", help="Path to output image.")
-    parser.add_argument("--top-n", type=int, default=5, help="Number of top methods to keep per sequence length.")
+    parser.add_argument("--top-n", type=int, default=2, help="Number of top methods to keep per sequence length.")
     parser.add_argument(
         "--causal",
         type=str,

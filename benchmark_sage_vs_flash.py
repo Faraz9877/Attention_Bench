@@ -830,8 +830,8 @@ def main() -> None:
         help="Comma-separated substrings to filter model names from --models-config (default: all).",
     )
     parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16"])
-    parser.add_argument("--warmup", type=int, default=10)
-    parser.add_argument("--iters", type=int, default=100)
+    parser.add_argument("--warmup", type=int, default=2)
+    parser.add_argument("--iters", type=int, default=5)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument(
         "--causal-only",

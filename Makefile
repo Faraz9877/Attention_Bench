@@ -54,6 +54,9 @@ install_dep_best_effort: install_dep install_optional_baselines
 bench:
 	$(PYTHON) benchmark_sage_vs_flash.py
 
+plot:
+	$(PYTHON) plot_results.py
+
 bench_causal:
 	$(PYTHON) benchmark_sage_vs_flash.py --causal-only
 
